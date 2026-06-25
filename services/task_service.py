@@ -1,10 +1,9 @@
 import httpx
-from fastapi import HTTPException
+from fastapi import HTTPException, status
 from repositories.task_repo import TaskRepository
 from models.task import Task
-from schemas.task import TaskCreate
+from schemas.task import TaskCreate, TaskUpdate
 
-# Базовые URL микросервисов (без путей эндпоинтов)
 CONTRACTS_SERVICE_URL = "http://localhost:8002/api/v1/contracts"
 NOTIFICATIONS_SERVICE_URL = "http://localhost:8003/api/v1/notifications"
 
@@ -17,21 +16,71 @@ class TaskService:
         new_task = Task(**payload.model_dump(), company_id=company_id, status="created")
         return await self.repo.create(new_task)
 
-    async def list_available_tasks(self, company_id: int):
-        return await self.repo.get_available_by_company(company_id)
+    async def get_task_by_id(self, task_id: int, company_id: int) -> Task:
+        task = await self.repo.get_by_id(task_id)
+        if not task or task.company_id != company_id:
+            raise HTTPException(status_code=404, detail="Задача не найдена или нет доступа")
+        return task
+
+    async def list_tasks(self, company_id: int, role: str):
+        """Разделение вывода: исполнитель видит только доступные, менеджер - все"""
+        if role == "Contractor":
+            return await self.repo.get_available_by_company(company_id)
+        return await self.repo.get_all_by_company(company_id)
+
+    async def update_task_details(self, task_id: int, payload: TaskUpdate, company_id: int) -> Task:
+        task = await self.get_task_by_id(task_id, company_id)
+
+        if task.status != "created":
+            raise HTTPException(
+                status_code=400,
+                detail="Нельзя редактировать задачу, которая уже принята или завершена"
+            )
+
+        # Обновляем только те поля, которые прислал клиент
+        update_data = payload.model_dump(exclude_unset=True)
+        for key, value in update_data.items():
+            setattr(task, key, value)
+
+        await self.repo.save_changes()
+        return task
+
+    async def update_task_status_explicitly(self, task_id: int, new_status: str, company_id: int) -> Task:
+        """Изменение статуса (например, перевод менеджером в completed)"""
+        task = await self.get_task_by_id(task_id, company_id)
+
+        valid_statuses = ["created", "accepted", "completed", "cancelled"]
+        if new_status not in valid_statuses:
+            raise HTTPException(status_code=400, detail="Неверный статус")
+
+        task.status = new_status
+        await self.repo.save_changes()
+
+        # Шлем нотификацию об изменении статуса
+        async with httpx.AsyncClient() as client:
+            try:
+                await client.post(
+                    f"{NOTIFICATIONS_SERVICE_URL}/send",
+                    json={
+                        "user_id": 1,
+                        "message": f"Статус задачи #{task.id} изменен на '{new_status}'.",
+                        "notification_type": "task_status_changed"
+                    },
+                    timeout=2.0
+                )
+            except httpx.RequestError:
+                pass
+
+        return task
 
     async def accept_task(self, task_id: int, contractor_id: int, company_id: int) -> Task:
-        # 1. Быстро читаем задачу из БД
-        task = await self.repo.get_by_id(task_id)
+        """Метод принятия задачи исполнителем (Интеграционный метод)"""
+        task = await self.get_task_by_id(task_id, company_id)
 
-        if not task:
-            raise HTTPException(status_code=404, detail="Задача не найдена")
         if task.status != "created":
             raise HTTPException(status_code=400, detail="Задача уже кем-то принята")
-        if task.company_id != company_id:
-            raise HTTPException(status_code=403, detail="Нет доступа к этой компании")
 
-        # 2. Внешний сетевой запрос к сервису Контрактов
+        # Сетевой запрос к сервису Контрактов (до фиксации изменений в БД)
         contract_id = None
         async with httpx.AsyncClient() as client:
             try:
@@ -48,31 +97,38 @@ class TaskService:
                 if contract_res.status_code == 201:
                     contract_id = contract_res.json().get("id")
             except httpx.RequestError:
-                # Заглушка, если contracts-service еще не запущен
-                contract_id = 777
+                contract_id = 777  # Заглушка для локальных тестов
 
-        # 3. Применяем все изменения к объекту разом
         task.contractor_id = contractor_id
         task.status = "accepted"
         task.contract_id = contract_id
 
-        # 4. Сохраняем состояние задачи в локальной БД (Один быстрый коммит)
         await self.repo.save_changes()
 
-        # 5. ИНТЕГРАЦИЯ: Отправляем запрос в микросервис Notifications
+        # Сетевой запрос к сервису Уведомлений
         async with httpx.AsyncClient() as client:
             try:
                 await client.post(
-                    f"{NOTIFICATIONS_SERVICE_URL}/send",  # <--- Исправили путь к роутеру
+                    f"{NOTIFICATIONS_SERVICE_URL}/send",
                     json={
-                        "user_id": 1,  # Шлем менеджеру с ID 1, чтобы увидеть в GET-запросе уведомлений
+                        "user_id": 1,
                         "message": f"Исполнитель {contractor_id} принял задачу #{task.id} ('{task.title}').",
-                        "notification_type": "task_accepted"  # <--- Переименовали в notification_type
+                        "notification_type": "task_accepted"
                     },
                     timeout=2.0
                 )
             except httpx.RequestError:
-                # Если сервис уведомлений недоступен, логика тасков все равно успешно завершится
                 pass
 
         return task
+
+    async def delete_task(self, task_id: int, company_id: int):
+        task = await self.get_task_by_id(task_id, company_id)
+
+        if task.status != "created":
+            raise HTTPException(
+                status_code=400,
+                detail="Нельзя удалить задачу, которая уже находится в работе или завершена"
+            )
+
+        await self.repo.delete(task)

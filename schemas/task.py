@@ -8,9 +8,20 @@ class TaskCreate(BaseModel):
     description: Optional[str] = None
     budget: Decimal
 
+class TaskUpdate(BaseModel):
+    """Схема для частичного обновления данных (PUT/PATCH)"""
+    title: Optional[str] = None
+    description: Optional[str] = None
+    budget: Optional[Decimal] = None
+
+class TaskStatusUpdate(BaseModel):
+    """Схема строго для перевода задачи по этапам жизненного цикла"""
+    status: str  # created, accepted, completed, cancelled
+
 class TaskResponse(BaseModel):
     id: int
     title: str
+    description: Optional[str] = None
     status: str
     budget: Decimal
     company_id: int
@@ -19,4 +30,4 @@ class TaskResponse(BaseModel):
     created_at: datetime
 
     class Config:
-        from_attributes = True
+        from_attributes = True  # Для Pydantic V2
